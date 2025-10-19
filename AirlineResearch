@@ -1,0 +1,147 @@
+import os
+
+import streamlit as st
+from langgraph.graph import START, END, StateGraph
+from duckduckgo_search import DDGS
+from duckduckgo_search.exceptions import DuckDuckGoSearchException
+import time
+import random
+from openai import OpenAI
+from typing_extensions import TypedDict
+
+# Configure Streamlit layout with two columns: main content and logs
+st.set_page_config(layout="wide")
+main_content, log_content = st.columns(2)
+
+# Utility function to log messages in the log content column
+def util_st_log(content):
+    log_content.markdown(
+        f"<div style='font-size:10px; overflow-y: hidden'>{content}</div>",
+        unsafe_allow_html=True
+    )
+
+# Initialize titles for the app and logs
+log_content.title("Logs")
+main_content.title("Agentic AI Framework - LangGraph")
+
+# Setup API clients
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key)
+ddgs = DDGS()
+
+# Define state structure
+class State(TypedDict):
+    search_results: list
+    insights: str
+    review_feedback: str
+    need_review: bool
+    iteration: int
+    airline: str
+
+# Data gathering agent to fetch search results
+class DataGathererAgent:
+    def gather_data(self, state: State, max_retries: int = 3):
+        airline = state["airline"]
+        util_st_log(f"Gathering data for {airline}...")
+        queries = [
+            f"{airline} airline history overview",
+            f"{airline} airline leadership structure",
+            f"{airline} airline fleet, routes, market presence",
+            f"{airline} airline revenue, growth, market share",
+            f"{airline} airline partnerships and expansion",
+            f"{airline} airline recent news and updates"
+        ]
+
+        search_results = []
+        for query in queries:
+            for attempt in range(max_retries):
+                try:
+                    results = ddgs.text(query, max_results=1)
+                    util_st_log(f"Search results for '{query}': {results}")
+                    if results:
+                        search_results.extend(results)
+                    time.sleep(random.uniform(1.0, 3.0))
+                    break
+                except DuckDuckGoSearchException as e:
+                    util_st_log(f"Search error: {str(e)}")
+                    if "Ratelimit" in str(e):
+                        wait_time = (attempt + 1) * 5
+                        util_st_log(f"Rate limit hit. Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                    if attempt == max_retries - 1:
+                        util_st_log(f"Max retries reached for query: {query}. Continuing with available data.")
+
+        if not search_results:
+            util_st_log("No search results obtained. Using fallback data.")
+            search_results = [{
+                "title": f"About {airline}",
+                "body": f"Fallback information about {airline}. This is placeholder data."
+            }]
+        return {"search_results": search_results, "iteration": 0, "insights": "", "review_feedback": None, "airline": state["airline"]}
+
+# Analysis agent to generate insights
+class AnalysisAgent:
+    def analyze_data(self, state: State):
+        search_content = "\n".join([result["body"] for result in state["search_results"] if "body" in result])
+        prompt = ("Summarize the following search content about an airline in clear, informative paragraphs.")
+        if state["review_feedback"]:
+            prompt += f"\n\nFeedback from reviewer: {state['review_feedback']}"
+
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": "You are an expert data analyst."},
+                      {"role": "user", "content": prompt}]
+        )
+
+        insights = response.choices[0].message.content
+        util_st_log(f"Insights: {insights}")
+        return {"search_results": state["search_results"], "insights": insights, "iteration": state["iteration"], "review_feedback": None, "airline": state["airline"]}
+
+# Reviewer agent to review the insights
+class ReviewerAgent:
+    def review_insights(self, state: State, max_iterations=2):
+        review_prompt = ("Review the following airline report for clarity and quality. If revision is needed, start with 'Needs revision'.")
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": "You are an expert reviewer."},
+                      {"role": "user", "content": state["insights"]}]
+        )
+
+        review_feedback = response.choices[0].message.content
+        need_revision = "Needs revision" in review_feedback and state["iteration"] < max_iterations
+
+        util_st_log(f"Review feedback: {review_feedback}")
+        return {"search_results": state["search_results"], "insights": state["insights"], "iteration": state["iteration"] + 1, "review_feedback": review_feedback if need_revision else None, "airline": state["airline"], "need_review": need_revision}
+
+# Report compiler agent to display the final report
+class ReportCompilerAgent:
+    def compile_report(self, state: State):
+        main_content.title(f"Airline Report for {state['airline']}")
+        main_content.write(state["insights"])
+        return state
+
+# Instantiate agents
+data_gatherer = DataGathererAgent()
+analysis_agent = AnalysisAgent()
+reviewer_agent = ReviewerAgent()
+report_compiler = ReportCompilerAgent()
+
+# Build the state graph
+builder = StateGraph(State)
+builder.add_node("gather_data", data_gatherer.gather_data)
+builder.add_node("analyze_data", analysis_agent.analyze_data)
+builder.add_node("review_insights", reviewer_agent.review_insights)
+builder.add_node("compile_report", report_compiler.compile_report)
+
+builder.add_edge(START, "gather_data")
+builder.add_edge("gather_data", "analyze_data")
+builder.add_conditional_edges("analyze_data", lambda state: "review_insights")
+builder.add_conditional_edges("review_insights", lambda state: "analyze_data" if state["need_review"] else "compile_report")
+
+graph = builder.compile()
+
+# User input and process trigger
+airline = main_content.text_input("Enter the name of an airline", "Cathay Pacific")
+if main_content.button("Generate Report"):
+    initial_state = {"search_results": [], "insights": "", "iteration": 0, "review_feedback": None, "airline": airline}
+    graph.invoke(initial_state)
